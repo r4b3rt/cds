@@ -4,11 +4,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/blastrain/vitess-sqlparser/sqlparser"
+	"math/rand"
 	"net/url"
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/dchest/siphash"
@@ -30,6 +31,15 @@ var (
 	insertTypeErr    = errors.New("data type must be  []*sturct or []struct ")
 	ckDnsErr         = errors.New("parse clickhosue connect string fail . ")
 )
+
+var (
+	parseInsertSQLRe = regexp.MustCompile(`(?m)#{[0-9a-zA-Z_]+}`)
+	tokenRe          = regexp.MustCompile("\\s+")
+)
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 func panicIfErr(err error) {
 	if err != nil {
@@ -74,9 +84,8 @@ func findFieldIndexByTag(t reflect.Type, tag, tagValue string) (int, error) {
 }
 
 func generateInsertSQL(query string) (string, []string) {
-	var re = regexp.MustCompile(`(?m)#{[0-9a-zA-Z_]+}`)
 	trueSQL := query
-	find := re.FindAllString(query, -1)
+	find := parseInsertSQLRe.FindAllString(query, -1)
 	tags := make([]string, 0, len(find))
 	for _, match := range find {
 		trueSQL = strings.Replace(trueSQL, match, "?", 1)
@@ -89,25 +98,38 @@ func generateInsertSQL(query string) (string, []string) {
 	return trueSQL, tags
 }
 
-func parseInsertSQLTableName(insertSQL string) (db string, table string) {
-	parser, err := sqlparser.Parse(insertSQL)
-	if err != nil {
-		return unknowDB, unknowTable
-	}
-	insertParser, isInsert := parser.(*sqlparser.Insert)
-	if !isInsert {
-		return unknowDB, unknowTable
-	}
+func containsComment(query string) bool {
+	return strings.Contains(query, `--`) || strings.Contains(query, `/*`)
+}
 
-	db = insertParser.Table.Qualifier.String()
-	table = insertParser.Table.Name.String()
-	if db == "" {
-		db = unknowDB
+func parseInsertSQLTableName(insertSQL string) (db string, table string) {
+	tokens := tokenRe.Split(strings.ToLower(insertSQL), -1)
+	var intoIdxs []int
+
+	for i, token := range tokens {
+		if token == "into" {
+			intoIdxs = append(intoIdxs, i)
+		}
 	}
-	if table == "" {
-		table = unknowTable
+	for _, intoIdx := range intoIdxs {
+		if intoIdx == 0 && intoIdx == len(tokens)-1 {
+			continue
+		}
+		if tokens[intoIdx-1] == "insert" {
+			if tokens[intoIdx+1] == "values" || strings.HasPrefix(tokens[intoIdx+1], "(") {
+				continue
+			}
+			splits := strings.Split(tokens[intoIdx+1], ".")
+			if len(strings.Split(tokens[intoIdx+1], ".")) == 2 {
+				return splits[0], splits[1]
+			} else {
+				return unknowDB, splits[0]
+			}
+		} else {
+			continue
+		}
 	}
-	return db, table
+	return unknowDB, unknowTable
 }
 
 // dest 是指针的 interface
@@ -137,29 +159,6 @@ func getDataBatch(hashIdx int, shardNum int, args []rowValue) ([][]rowValue, err
 		dataBatch[idx] = append(dataBatch[idx], rowValue)
 	}
 	return dataBatch, nil
-}
-
-func execOnNode(dbNode *sql.DB, query string, rows []rowValue) error {
-	tx, err := dbNode.Begin()
-	if err != nil {
-		return err
-	}
-	stmt, err := tx.Prepare(query)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, row := range rows {
-		_, err := stmt.Exec(row...)
-		if err != nil {
-			return err
-		}
-	}
-	err = tx.Commit()
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func saveData(db *sql.DB, insertSql string, values []rowValue) error {

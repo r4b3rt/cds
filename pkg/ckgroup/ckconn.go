@@ -259,7 +259,9 @@ func (client *ckConn) QueryStream(dataChan interface{}, query string, args ...in
 }
 
 func (client *ckConn) Insert(query string, sliceData interface{}) error {
-	now := time.Now()
+	if containsComment(query) {
+		return errors.New("comments are not allowed")
+	}
 	outerType := reflect.TypeOf(sliceData)
 	if outerType.Kind() != reflect.Slice {
 		return insertTypeErr
@@ -290,7 +292,10 @@ func (client *ckConn) Insert(query string, sliceData interface{}) error {
 		}
 		argss = append(argss, args)
 	}
-
+	if len(argss) == 0 {
+		return nil
+	}
+	now := time.Now()
 	err := saveData(client.Conn, insertSQL, argss)
 	db, table := parseInsertSQLTableName(insertSQL)
 	isSuccess := ""
@@ -299,8 +304,10 @@ func (client *ckConn) Insert(query string, sliceData interface{}) error {
 	} else {
 		isSuccess = "0"
 	}
-	insertCntHis.With(getInsertLabel(db, table, client.Host, isSuccess)).Observe(float64(len(argss)))
-	insertDuHis.With(getInsertLabel(db, table, client.Host, isSuccess)).Observe(float64(time.Since(now).Milliseconds()))
+	label := getInsertLabel(db, table, client.Host, isSuccess)
+	insertDuHis.With(label).Observe(float64(time.Since(now).Milliseconds()))
+	insertBatchSizeGa.With(label).Set(float64(len(argss)))
+	insertBatchSizeHis.With(label).Observe(float64(len(argss)))
 	return err
 }
 

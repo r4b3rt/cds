@@ -3,16 +3,18 @@ package ckgroup
 import (
 	"errors"
 	"fmt"
-	"github.com/tal-tech/cds/pkg/ckgroup/dbtesttool/dbtool"
 	"testing"
+
+	"github.com/tal-tech/cds/pkg/ckgroup/dbtesttool/dbtool"
+	"golang.org/x/time/rate"
 )
 
 func Test_dbGroup_InsertAutoDetail(t *testing.T) {
 	dataSet := dbtool.GenerateDataSet(10000)
 
 	c1 := dbGroup{
-		ShardNodes: []ShardConn{&fakeInsertShardConn{true}, &fakeInsertShardConn{true}, &fakeInsertShardConn{true}},
-		opt:        option{RetryNum: 3},
+		ShardNodes: []ShardConn{&fakeShardConn{true}, &fakeShardConn{true}, &fakeShardConn{true}},
+		opt:        option{RetryNum: 3, GroupInsertLimiter: rate.NewLimiter(rate.Inf, 0)},
 	}
 	errDetail1, err := c1.InsertAutoDetail(``, "pk", dataSet)
 	if err != nil {
@@ -27,8 +29,8 @@ func Test_dbGroup_InsertAutoDetail(t *testing.T) {
 		fmt.Println(len(item.Datas.([]*dbtool.DataInstance)))
 	}
 	c2 := dbGroup{
-		ShardNodes: []ShardConn{&fakeInsertShardConn{false}, &fakeInsertShardConn{false}, &fakeInsertShardConn{false}},
-		opt:        option{RetryNum: 3},
+		ShardNodes: []ShardConn{&fakeShardConn{false}, &fakeShardConn{false}, &fakeShardConn{false}},
+		opt:        option{RetryNum: 3, GroupInsertLimiter: rate.NewLimiter(rate.Inf, 0)},
 	}
 	errDetail2, err := c2.InsertAutoDetail(``, "pk", dataSet)
 	if err != nil {
@@ -39,8 +41,8 @@ func Test_dbGroup_InsertAutoDetail(t *testing.T) {
 	}
 
 	c3 := dbGroup{
-		ShardNodes: []ShardConn{&fakeInsertShardConn{false}, &fakeInsertShardConn{true}, &fakeInsertShardConn{false}},
-		opt:        option{RetryNum: 3},
+		ShardNodes: []ShardConn{&fakeShardConn{false}, &fakeShardConn{true}, &fakeShardConn{false}},
+		opt:        option{RetryNum: 3, GroupInsertLimiter: rate.NewLimiter(rate.Inf, 0)},
 	}
 	errDetail3, err := c3.InsertAutoDetail(``, "pk", dataSet)
 	if err != nil {
@@ -54,41 +56,44 @@ func Test_dbGroup_InsertAutoDetail(t *testing.T) {
 	fmt.Println(len(errDetail3[0].Datas.([]*dbtool.DataInstance)))
 }
 
-type fakeInsertShardConn struct {
+type fakeShardConn struct {
 	isFail bool
 }
 
-func (i *fakeInsertShardConn) GetAllConn() []CKConn {
+func (i *fakeShardConn) GetAllConn() []CKConn {
 	panic("implement me")
 }
 
-func (i *fakeInsertShardConn) GetReplicaConn() []CKConn {
+func (i *fakeShardConn) GetReplicaConn() []CKConn {
 	panic("implement me")
 }
 
-func (i *fakeInsertShardConn) GetShardConn() CKConn {
+func (i *fakeShardConn) GetShardConn() CKConn {
 	panic("implement me")
 }
 
-func (i *fakeInsertShardConn) Exec(ignoreErr bool, query string, args ...interface{}) []hostErr {
+func (i *fakeShardConn) Exec(ignoreErr bool, query string, args ...interface{}) []hostErr {
 	panic("implement me")
 }
 
-func (i *fakeInsertShardConn) ExecReplica(ignoreErr bool, query string, args ...interface{}) []hostErr {
+func (i *fakeShardConn) ExecReplica(ignoreErr bool, query string, args ...interface{}) []hostErr {
 	panic("implement me")
 }
 
-func (i *fakeInsertShardConn) ExecAuto(query string, args ...interface{}) error {
-	panic("implement me")
+func (i *fakeShardConn) AlterAuto(query string, args ...interface{}) error {
+	if i.isFail {
+		return errors.New("fake exec auto error")
+	}
+	return nil
 }
 
-func (i *fakeInsertShardConn) InsertAuto(query string, sliceData interface{}) error {
+func (i *fakeShardConn) InsertAuto(query string, sliceData interface{}) error {
 	if i.isFail {
 		return errors.New("fake insert error")
 	}
 	return nil
 }
 
-func (i *fakeInsertShardConn) Close() {
+func (i *fakeShardConn) Close() {
 	panic("implement me")
 }

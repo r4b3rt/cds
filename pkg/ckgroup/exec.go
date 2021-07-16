@@ -2,10 +2,107 @@ package ckgroup
 
 import (
 	"errors"
+	"math/rand"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/tal-tech/go-zero/core/logx"
 	"golang.org/x/sync/errgroup"
 )
+
+type ExecErrDetail struct {
+	Err error
+	// 发生错误的ckconn对象
+	Conn CKConn
+}
+
+type AlterErrDetail struct {
+	Err error
+	// 发生错误的shardconn对象
+	Conn       ShardConn
+	ShardIndex int
+}
+
+func (g *dbGroup) ExecSerialAll(onErrContinue bool, query string, args ...interface{}) ([]ExecErrDetail, error) {
+	if isAlterSQL(query) {
+		return nil, errors.New("is alert sql")
+	}
+	var errDetail []ExecErrDetail
+	for _, conn := range g.GetAllNodes() {
+		err := conn.Exec(query, args...)
+		if err != nil {
+			errDetail = append(errDetail, ExecErrDetail{Err: err, Conn: conn})
+		}
+		if !onErrContinue && err != nil {
+			return errDetail, nil
+		}
+	}
+	return errDetail, nil
+}
+
+func (g *dbGroup) ExecParallelAll(query string, args ...interface{}) ([]ExecErrDetail, error) {
+	if isAlterSQL(query) {
+		return nil, errors.New("is alert sql")
+	}
+	waitGroup := sync.WaitGroup{}
+	waitGroup.Add(len(g.GetAllNodes()))
+	ch := make(chan ExecErrDetail, len(g.GetAllNodes()))
+
+	for _, conn := range g.GetAllNodes() {
+		innerConn := conn
+		go func() {
+			defer waitGroup.Done()
+			if err := innerConn.Exec(query, args...); err != nil {
+				ch <- ExecErrDetail{Err: err, Conn: innerConn}
+			}
+		}()
+	}
+	waitGroup.Wait()
+
+	close(ch)
+	var errs []ExecErrDetail
+	for execErrDetail := range ch {
+		errs = append(errs, execErrDetail)
+	}
+	return errs, nil
+}
+
+func isAlterSQL(sql string) bool {
+	return strings.HasPrefix(strings.TrimSpace(strings.ToLower(sql)), `alter`)
+}
+
+func (g *dbGroup) AlterAuto(query string, args ...interface{}) ([]AlterErrDetail, error) {
+	if !isAlterSQL(query) {
+		return nil, errors.New("not alert sql")
+	}
+
+	waitGroup := sync.WaitGroup{}
+	waitGroup.Add(len(g.GetAllShard()))
+	ch := make(chan AlterErrDetail, len(g.GetAllShard()))
+
+	for i, conn := range g.GetAllShard() {
+		innerConn := conn
+		innerShardIndex := i + 1
+
+		go func() {
+			defer waitGroup.Done()
+			if err := innerConn.AlterAuto(query, args...); err != nil {
+				ch <- AlterErrDetail{Err: err, Conn: innerConn, ShardIndex: innerShardIndex}
+			}
+		}()
+	}
+	waitGroup.Wait()
+	close(ch)
+	var errs []AlterErrDetail
+	for item := range ch {
+		errs = append(errs, item)
+	}
+	sort.Slice(errs, func(i, j int) bool {
+		return errs[i].ShardIndex < errs[j].ShardIndex
+	})
+	return errs, nil
+}
 
 func (g *dbGroup) ExecAuto(query string, hashIdx int, args [][]interface{}) error {
 	if len(args) == 0 || len(args[0]) == 0 || hashIdx >= len(args[0]) {
@@ -58,25 +155,21 @@ func (g *dbGroup) ExecAll(query string, args [][]interface{}) error {
 }
 
 func (g *dbGroup) exec(idx int, query string, rows []rowValue) error {
+	shardConns := g.GetAllShard()[idx].GetAllConn()
+	execOrder := rand.Perm(len(shardConns))
 	var err error
 	for attempt := 1; attempt <= g.opt.RetryNum; attempt++ {
-		err = execOnNode(g.ShardNodes[idx].GetShardConn().GetRawConn(), query, rows)
-		if err != nil {
-			logx.Infof("[attempt %d/%d] Node[%d] primary node execute error:%v, will switch to replica node", attempt, g.opt.RetryNum, idx, err)
-		} else {
-			return nil
-		}
-		for i, replicaNode := range g.ShardNodes[idx].GetReplicaConn() {
-			err = execOnNode(replicaNode.GetRawConn(), query, rows)
-			if err != nil {
-				logx.Infof("[attempt %d/%d] Node[%d] replica[%d] execute error:%v, will switch to next replica node", attempt, g.opt.RetryNum, idx, i, err)
-			} else {
+		for _, order := range execOrder {
+			err = saveData(shardConns[order].GetRawConn(), query, rows)
+			if err == nil {
 				return nil
 			}
+			logx.Errorf("[attempt %d/%d] shard[%d] node[%d] insert error:%s, will switch to next node", attempt, g.opt.RetryNum, idx+1, order+1, err.Error())
+			continue
 		}
 	}
 	if err != nil {
-		logx.Errorf("All node exec failed. Retry num:%d. Last fail reason: %v, query: %s", g.opt.RetryNum, err, query)
+		logx.Errorf("shard[%d] all node exec failed. Retry num:%d. Last fail reason: %v, query: %s", idx+1, g.opt.RetryNum, err, query)
 	}
 	return err
 }

@@ -1,6 +1,7 @@
 package ckgroup
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -18,6 +19,11 @@ func (g *dbGroup) InsertAuto(query string, hashTag string, sliceData interface{}
 	shardDatas, err := cutData2ShardData(sliceData, len(g.ShardNodes), hashTag)
 	if err != nil {
 		return err
+	}
+
+	err = g.opt.GroupInsertLimiter.Wait(context.Background())
+	if err != nil {
+		logx.Error(err)
 	}
 
 	var eg errgroup.Group
@@ -54,9 +60,15 @@ func (g *dbGroup) InsertAutoDetail(query string, hashTag string, sliceData inter
 	if err != nil {
 		return nil, err
 	}
-	var errDetail []InsertErrDetail
+
+	err = g.opt.GroupInsertLimiter.Wait(context.Background())
+	if err != nil {
+		logx.Error(err)
+	}
+
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(len(g.ShardNodes))
+	ch := make(chan InsertErrDetail, len(g.GetAllShard()))
 
 	for i, shardConn := range g.ShardNodes {
 		shardData := shardDatas[i].Elem().Interface()
@@ -71,13 +83,19 @@ func (g *dbGroup) InsertAutoDetail(query string, hashTag string, sliceData inter
 				} else {
 					logx.Errorf("[attempt %d/%d] shard[%d] all node exec failed. Last fail reason: %v, query: %s", j, g.opt.RetryNum, innerShardIndex, err, query)
 					if j == g.opt.RetryNum {
-						errDetail = append(errDetail, InsertErrDetail{Err: err, ShardIndex: innerShardIndex, Datas: shardData})
+						ch <- InsertErrDetail{Err: err, ShardIndex: innerShardIndex, Datas: shardData}
 					}
 				}
 			}
 		}()
 	}
 	waitGroup.Wait()
+
+	close(ch)
+	var errDetail []InsertErrDetail
+	for item := range ch {
+		errDetail = append(errDetail, item)
+	}
 	sort.Slice(errDetail, func(i, j int) bool {
 		return errDetail[i].ShardIndex < errDetail[j].ShardIndex
 	})
